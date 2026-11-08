@@ -16,7 +16,7 @@ codegen-units = 1
 
 [features]
 i3 = ["i3ipc", "dep:font-loader"]
-hyprland = ["dep:hyprland", "wayland"]
+hyprland = ["dep:hyprland", "dep:serde", "dep:serde_json", "wayland"]
 wayland = ["wayland-client", "wayland-protocols", "wayland-protocols-wlr", "memmap2", "nix", "tempfile", "xkbcommon"]
 
 [dependencies]
@@ -25,6 +25,8 @@ css-color-parser = "0.1"
 font-loader = { version = "0.11", optional = true }
 i3ipc = { version = "0.10", optional = true }
 hyprland = { version = "0.4.0-beta.3", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 itertools = "0.13"
 log = "0.4"
 pretty_env_logger = "0.5"

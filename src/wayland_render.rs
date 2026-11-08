@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use hyprland::prelude::{HyprData, HyprDataVec};
 use log::info;
 use std::collections::HashMap;
 use std::os::fd::AsFd;
@@ -412,9 +411,8 @@ impl WaylandRenderer {
         event_queue.roundtrip(&mut state)?;
 
         // Get Hyprland monitor list – authoritative for window coordinate space and focus state.
-        let hypr_monitors = hyprland::data::Monitors::get()
-            .context("Failed to get Hyprland monitors")?
-            .to_vec();
+        let hypr_monitors =
+            crate::wm_hyprland::get_monitors().context("Failed to get Hyprland monitors")?;
 
         // Create one layer surface per output (or a single fallback surface).
         let mut wayland_surfaces: Vec<(

@@ -685,6 +685,8 @@ dependencies = [
  "nix",
  "pretty_env_logger",
  "regex",
+ "serde",
+ "serde_json",
  "tempfile",
  "wayland-client",
  "wayland-protocols",
