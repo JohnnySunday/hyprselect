@@ -81,6 +81,7 @@ fn crawl_windows(root_node: &Node, workspace: &Workspace) -> Result<Vec<DesktopW
                 let window = DesktopWindow {
                     id: node.id,
                     x_window_id: node.window,
+                    address: None,
                     pos: (pos_x, pos_y),
                     size: (size_x, (node.rect.3 + node.deco_rect.3)),
                     is_focused: node.focused,

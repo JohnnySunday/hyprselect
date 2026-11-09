@@ -53,6 +53,8 @@ pub struct DesktopWindow {
     #[allow(dead_code)]
     x_window_id: Option<i32>,
     #[allow(dead_code)]
+    address: Option<String>,
+    #[allow(dead_code)]
     pos: (i32, i32),
     #[allow(dead_code)]
     size: (i32, i32),
@@ -396,19 +398,33 @@ fn main() -> Result<()> {
         hints.insert(hint, window);
     }
 
+    let print_only = app_config.print_only;
+    let swap = app_config.swap;
+
     // Create Wayland renderer and display hints
     let mut renderer = WaylandRenderer::new(app_config)?;
 
     // Render hints on windows
     renderer.render_hints(&desktop_windows, &hints)?;
 
-    // Wait for user input and focus selected window
+    // Wait for user input and handle selected window
     if let Some(selected_window) = renderer.wait_for_hint_selection(&hints)? {
-        info!(
-            "Focusing window at ({}, {})",
-            selected_window.pos.0, selected_window.pos.1
-        );
-        wm::focus_window(selected_window)?;
+        if print_only {
+            if let Some(ref address) = selected_window.address {
+                println!("{address}");
+            } else {
+                println!("0x{:x}", selected_window.id);
+            }
+        } else if swap {
+            let active_window = desktop_windows.iter().find(|window| window.is_focused);
+            wm::swap_windows(active_window, selected_window).context("Couldn't swap windows")?;
+        } else {
+            info!(
+                "Focusing window at ({}, {})",
+                selected_window.pos.0, selected_window.pos.1
+            );
+            wm::focus_window(selected_window)?;
+        }
     }
 
     Ok(())

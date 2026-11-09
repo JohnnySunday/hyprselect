@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use hyprland::dispatch::{Dispatch as HyprDispatch, DispatchType};
 use hyprland::shared::Address;
-use log::{debug, info, warn};
+use log::{debug, info};
 use serde::Deserialize;
 
 use crate::args::{normalize_address, FilterMode, FilterRule, WindowFilter};
@@ -241,6 +241,7 @@ pub fn get_windows_filtered(
         let window = DesktopWindow {
             id,
             x_window_id: None, // Wayland doesn't use X11 window IDs
+            address: Some(client.address.to_string()),
             pos: (client.at.0 as i32, client.at.1 as i32),
             size: (client.size.0 as i32, client.size.1 as i32),
             is_focused: active_address.as_ref() == Some(&client.address),
@@ -270,6 +271,14 @@ fn compute_client_id(address: &Address) -> i64 {
 /// which lets us send the Lua dispatcher expression instead.
 fn focus(address: &Address) -> Result<()> {
     let dispatcher = format!("hl.dsp.focus({{ window = 'address:{address}' }})");
+    debug!("Dispatching `{dispatcher}`");
+    HyprDispatch::call(DispatchType::Custom(&dispatcher, ""))?;
+    Ok(())
+}
+
+/// Swap the currently focused window with the window at the given address.
+fn swap(target_address: &Address) -> Result<()> {
+    let dispatcher = format!("hl.dsp.window.swap({{ target = 'address:{target_address}' }})");
     debug!("Dispatching `{dispatcher}`");
     HyprDispatch::call(DispatchType::Custom(&dispatcher, ""))?;
     Ok(())
@@ -313,32 +322,37 @@ pub fn focus_window(window: &DesktopWindow) -> Result<()> {
 }
 
 /// Swap two windows.
-#[allow(dead_code)]
-pub fn swap_windows(active_window: &DesktopWindow, window: &DesktopWindow) -> Result<()> {
+pub fn swap_windows(active_window: Option<&DesktopWindow>, window: &DesktopWindow) -> Result<()> {
     let client_vec = get_clients().context("Failed to get clients")?;
 
-    let _active_client = client_vec
-        .iter()
-        .find(|c| compute_client_id(&c.address) == active_window.id)
-        .context("Could not find active client by ID")?;
+    let active_address = if let Some(aw) = active_window {
+        client_vec
+            .iter()
+            .find(|c| compute_client_id(&c.address) == aw.id)
+            .map(|c| c.address.clone())
+    } else {
+        None
+    }
+    .or_else(|| get_active_client().ok().flatten().map(|c| c.address))
+    .context("Could not find active window to swap with")?;
 
     let target_client = client_vec
         .iter()
         .find(|c| compute_client_id(&c.address) == window.id)
         .context("Could not find target client by ID")?;
 
+    if active_address == target_client.address {
+        debug!("Active window and target window are the same; nothing to swap");
+        return Ok(());
+    }
+
     info!(
-        "Swapping windows at ({}, {}) <-> ({}, {})",
-        active_window.pos.0, active_window.pos.1, window.pos.0, window.pos.1
+        "Swapping active window ({}) <-> {} at ({}, {})",
+        active_address, target_client.title, window.pos.0, window.pos.1
     );
 
-    // TODO: Implement proper window swapping for Hyprland.
-    // Hyprland 0.56 exposes `hl.dsp.window.swap({ target = … })`, which swaps the
-    // *focused* window with the target; wiring that up needs the active window to
-    // be focused first. For now, just focus the target window.
-    focus(&target_client.address).context("Failed to focus target window")?;
-
-    warn!("Window swapping not fully implemented for Hyprland yet");
+    focus(&active_address).context("Failed to focus active window before swap")?;
+    swap(&target_client.address).context("Failed to swap windows")?;
 
     Ok(())
 }
