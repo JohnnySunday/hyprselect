@@ -9,6 +9,7 @@ use hyprland::shared::Address;
 use log::{debug, info, warn};
 use serde::Deserialize;
 
+use crate::args::{normalize_address, FilterMode, FilterRule, WindowFilter};
 use crate::DesktopWindow;
 
 /// Basic workspace identifier from Hyprland IPC.
@@ -23,6 +24,23 @@ pub struct WorkspaceBasic {
     pub name: String,
 }
 
+fn deserialize_fullscreen<'de, D>(deserializer: D) -> std::result::Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FullscreenValue {
+        Bool(bool),
+        Int(u8),
+    }
+    match Option::<FullscreenValue>::deserialize(deserializer)? {
+        Some(FullscreenValue::Bool(b)) => Ok(u8::from(b)),
+        Some(FullscreenValue::Int(n)) => Ok(n),
+        None => Ok(0),
+    }
+}
+
 /// Client (window) info deserialized from `j/clients` or `j/activewindow`.
 #[derive(Deserialize, Debug, Clone)]
 pub struct ClientInfo {
@@ -30,12 +48,86 @@ pub struct ClientInfo {
     pub at: (i16, i16),
     pub size: (i16, i16),
     pub workspace: WorkspaceBasic,
+    #[serde(default)]
+    pub class: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default, rename = "initialClass")]
+    pub initial_class: String,
+    #[serde(default, rename = "initialTitle")]
+    pub initial_title: String,
+    #[serde(default)]
+    pub monitor: Option<i64>,
+    #[serde(default)]
+    pub pid: Option<i32>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub floating: bool,
+    #[serde(default, deserialize_with = "deserialize_fullscreen")]
+    pub fullscreen: u8,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub xwayland: bool,
+}
+
+impl ClientInfo {
+    /// Check if this client matches a single `WindowFilter`.
+    pub fn matches_filter(&self, filter: &WindowFilter, monitors: &[MonitorInfo]) -> bool {
+        let matched = match &filter.rule {
+            FilterRule::Class(re) => re.is_match(&self.class),
+            FilterRule::InitialClass(re) => re.is_match(&self.initial_class),
+            FilterRule::Title(re) => re.is_match(&self.title),
+            FilterRule::InitialTitle(re) => re.is_match(&self.initial_title),
+            FilterRule::Address(addr) => normalize_address(&self.address.to_string()) == *addr,
+            FilterRule::WorkspaceId(id) => {
+                self.workspace.id == Some(*id) || self.workspace.name == id.to_string()
+            }
+            FilterRule::WorkspaceName(re) => re.is_match(&self.workspace.name),
+            FilterRule::MonitorId(id) => self.monitor == Some(*id),
+            FilterRule::MonitorName(re) => self
+                .monitor
+                .and_then(|mid| monitors.iter().find(|m| m.id == Some(mid)))
+                .is_some_and(|m| re.is_match(&m.name)),
+            FilterRule::Pid(pid) => self.pid == Some(*pid),
+            FilterRule::Tag(re) => self.tags.iter().any(|t| re.is_match(t)),
+            FilterRule::Floating(val) => self.floating == *val,
+            FilterRule::Pinned(val) => self.pinned == *val,
+            FilterRule::XWayland(val) => self.xwayland == *val,
+            FilterRule::FullscreenBool(val) => (self.fullscreen != 0) == *val,
+            FilterRule::FullscreenMode(mode) => self.fullscreen == *mode,
+        };
+
+        if filter.negated {
+            !matched
+        } else {
+            matched
+        }
+    }
+
+    /// Check if this client matches the provided `WindowFilter`s according to `mode`.
+    pub fn matches_filters(
+        &self,
+        filters: &[WindowFilter],
+        mode: FilterMode,
+        monitors: &[MonitorInfo],
+    ) -> bool {
+        if filters.is_empty() {
+            return true;
+        }
+        match mode {
+            FilterMode::All => filters.iter().all(|f| self.matches_filter(f, monitors)),
+            FilterMode::Any => filters.iter().any(|f| self.matches_filter(f, monitors)),
+        }
+    }
 }
 
 /// Monitor info deserialized from `j/monitors all`.
 #[derive(Deserialize, Debug, Clone)]
 pub struct MonitorInfo {
+    #[serde(default)]
+    pub id: Option<i64>,
     pub name: String,
     pub width: u16,
     pub height: u16,
@@ -100,7 +192,16 @@ pub fn get_active_client() -> Result<Option<ClientInfo>> {
 }
 
 /// Return a list of all visible windows on active workspaces.
+#[allow(dead_code)]
 pub fn get_windows() -> Result<Vec<DesktopWindow>> {
+    get_windows_filtered(&[], FilterMode::All)
+}
+
+/// Return a list of visible windows on active workspaces matching `filters` according to `filter_mode`.
+pub fn get_windows_filtered(
+    filters: &[WindowFilter],
+    filter_mode: FilterMode,
+) -> Result<Vec<DesktopWindow>> {
     // Get all clients
     let client_vec = get_clients().context("Failed to get clients from Hyprland")?;
 
@@ -119,10 +220,11 @@ pub fn get_windows() -> Result<Vec<DesktopWindow>> {
 
     debug!("Visible workspaces: {:?}", visible_workspaces);
 
-    // Filter clients to only those on visible workspaces
+    // Filter clients to only those on visible workspaces and matching user filters
     let visible_clients: Vec<&ClientInfo> = client_vec
         .iter()
         .filter(|c| visible_workspaces.contains(&c.workspace.name.as_str()))
+        .filter(|c| c.matches_filters(filters, filter_mode, &monitor_vec))
         .collect();
 
     debug!("Found {} visible windows", visible_clients.len());
@@ -326,6 +428,136 @@ mod tests {
         assert_eq!(monitors[0].active_workspace.name, "2");
         assert_eq!(monitors[0].special_workspace.id, None);
         assert_eq!(monitors[0].special_workspace.name, "");
+    }
+
+    #[test]
+    fn test_client_filter_matching() {
+        use crate::args::parse_window_filter;
+
+        let clients_json = r#"[{
+            "address": "0x555ec23a3bb0",
+            "at": [3844, 24],
+            "size": [2552, 1572],
+            "workspace": { "id": 1, "name": "1" },
+            "floating": false,
+            "fullscreen": 0,
+            "pinned": false,
+            "xwayland": false,
+            "monitor": 0,
+            "pid": 4952,
+            "class": "neovide",
+            "title": "~/.config/hypr/hyprland.lua",
+            "initialClass": "neovide",
+            "initialTitle": "[Scratch]",
+            "tags": ["editor", "dev"]
+        }, {
+            "address": "0x555ec1f73ec0",
+            "at": [4608, 480],
+            "size": [896, 752],
+            "workspace": { "name": "special:S-signal" },
+            "floating": true,
+            "fullscreen": 2,
+            "pinned": true,
+            "xwayland": true,
+            "monitor": 1,
+            "pid": 1219,
+            "class": "signal",
+            "title": "Signal (6)",
+            "initialClass": "signal-desktop",
+            "initialTitle": "Signal",
+            "tags": ["chat"]
+        }]"#;
+
+        let monitors_json = r#"[{
+            "id": 0,
+            "name": "eDP-1",
+            "width": 2560,
+            "height": 1600,
+            "x": 0,
+            "y": 0,
+            "activeWorkspace": { "id": 1, "name": "1" },
+            "specialWorkspace": { "name": "" },
+            "scale": 1.0,
+            "focused": true
+        }, {
+            "id": 1,
+            "name": "DP-1",
+            "width": 2560,
+            "height": 1440,
+            "x": 2560,
+            "y": 0,
+            "activeWorkspace": { "id": 2, "name": "2" },
+            "specialWorkspace": { "name": "special:S-signal" },
+            "scale": 1.0,
+            "focused": false
+        }]"#;
+
+        let clients: Vec<ClientInfo> = serde_json::from_str(clients_json).unwrap();
+        let monitors: Vec<MonitorInfo> = serde_json::from_str(monitors_json).unwrap();
+        let c0 = &clients[0];
+        let c1 = &clients[1];
+
+        // class & negation
+        assert!(c0.matches_filter(&parse_window_filter("class:^neo").unwrap(), &monitors));
+        assert!(!c1.matches_filter(&parse_window_filter("class:^neo").unwrap(), &monitors));
+        assert!(c1.matches_filter(&parse_window_filter("!class:^neo").unwrap(), &monitors));
+
+        // initialClass & initialTitle & title
+        assert!(c1.matches_filter(&parse_window_filter("initialClass:desktop$").unwrap(), &monitors));
+        assert!(c0.matches_filter(&parse_window_filter("initialTitle:\\[Scratch\\]").unwrap(), &monitors));
+        assert!(c0.matches_filter(&parse_window_filter("title:hyprland\\.lua").unwrap(), &monitors));
+
+        // address (with and without 0x)
+        assert!(c0.matches_filter(&parse_window_filter("address:0x555ec23a3bb0").unwrap(), &monitors));
+        assert!(c0.matches_filter(&parse_window_filter("address:555EC23A3BB0").unwrap(), &monitors));
+        assert!(!c1.matches_filter(&parse_window_filter("address:0x555ec23a3bb0").unwrap(), &monitors));
+
+        // workspace (by id and by name regex)
+        assert!(c0.matches_filter(&parse_window_filter("workspace:1").unwrap(), &monitors));
+        assert!(!c1.matches_filter(&parse_window_filter("workspace:1").unwrap(), &monitors));
+        assert!(c1.matches_filter(&parse_window_filter("workspace:^special:").unwrap(), &monitors));
+
+        // monitor (by id and by name regex)
+        assert!(c0.matches_filter(&parse_window_filter("monitor:0").unwrap(), &monitors));
+        assert!(c0.matches_filter(&parse_window_filter("monitor:^eDP").unwrap(), &monitors));
+        assert!(c1.matches_filter(&parse_window_filter("monitor:DP-1").unwrap(), &monitors));
+
+        // pid & tags
+        assert!(c0.matches_filter(&parse_window_filter("pid:4952").unwrap(), &monitors));
+        assert!(c0.matches_filter(&parse_window_filter("tags:^dev$").unwrap(), &monitors));
+        assert!(!c1.matches_filter(&parse_window_filter("tags:^dev$").unwrap(), &monitors));
+
+        // booleans & fullscreen mode
+        assert!(c0.matches_filter(&parse_window_filter("floating:false").unwrap(), &monitors));
+        assert!(c1.matches_filter(&parse_window_filter("floating:true").unwrap(), &monitors));
+        assert!(c1.matches_filter(&parse_window_filter("pinned:true").unwrap(), &monitors));
+        assert!(c1.matches_filter(&parse_window_filter("xwayland:true").unwrap(), &monitors));
+        assert!(c0.matches_filter(&parse_window_filter("fullscreen:false").unwrap(), &monitors));
+        assert!(c1.matches_filter(&parse_window_filter("fullscreen:true").unwrap(), &monitors));
+        assert!(c1.matches_filter(&parse_window_filter("fullscreen:2").unwrap(), &monitors));
+
+        // Multiple filters combined with AND (FilterMode::All)
+        let filters = vec![
+            parse_window_filter("class:neovide").unwrap(),
+            parse_window_filter("!floating:true").unwrap(),
+            parse_window_filter("tags:editor").unwrap(),
+        ];
+        assert!(c0.matches_filters(&filters, FilterMode::All, &monitors));
+        assert!(!c1.matches_filters(&filters, FilterMode::All, &monitors));
+
+        // Multiple filters combined with OR (FilterMode::Any), e.g., multiple PIDs
+        let pid_filters = vec![
+            parse_window_filter("pid:4952").unwrap(),
+            parse_window_filter("pid:1219").unwrap(),
+            parse_window_filter("pid:9999").unwrap(),
+        ];
+        assert!(c0.matches_filters(&pid_filters, FilterMode::Any, &monitors));
+        assert!(c1.matches_filters(&pid_filters, FilterMode::Any, &monitors));
+        assert!(!c0.matches_filters(&pid_filters, FilterMode::All, &monitors));
+
+        // Empty filters always match in both modes
+        assert!(c0.matches_filters(&[], FilterMode::All, &monitors));
+        assert!(c0.matches_filters(&[], FilterMode::Any, &monitors));
     }
 
     #[test]

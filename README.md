@@ -126,6 +126,14 @@ Change up the default colors:
 
     hyprselect --textcolor red --textcoloralt "#eeeeee" --bgcolor "rgba(50, 50, 200, 0.5)"
 
+Filter which Hyprland windows receive hints (repeatable, combined with AND by default, or OR with `--filter-mode any` / `--filter-any`, prefix with `!` to exclude):
+
+    hyprselect --filter class:firefox
+    hyprselect -F 'class:kitty' -F '!title:scratchpad'
+    hyprselect -F 'floating:false' -F 'monitor:eDP-1'
+    hyprselect --filter-mode any -F pid:1234 -F pid:5678 -F pid:9012
+    hyprselect --filter-any -F pid:1234 -F pid:5678 -F pid:9012
+
 hyprselect will make use of a compositor to get real transparency.
 
 ## Full help
@@ -151,6 +159,15 @@ Options:
           Control_L+g Shift_L+f
   -s, --swap
           If this flag is set, the currently active window will swap with the selected window
+  -F, --filter <[!]PROP:VALUE>
+          Filter Hyprland windows by property (format: [!]<property>:<value>, repeatable). Supported
+          properties: class, initialClass, title, initialTitle, address, workspace, monitor, pid,
+          tags, floating, fullscreen, pinned, xwayland
+      --filter-mode <FILTER_MODE>
+          How multiple --filter flags are combined ('all'/'and' or 'any'/'or') [default: all]
+          [possible values: all, any]
+      --filter-any
+          Match windows that satisfy any --filter flag (shorthand for --filter-mode any)
       --textcolor <TEXT_COLOR>
           Text color (CSS notation) [default: #dddddd]
       --textcoloralt <TEXT_COLOR_ALT>

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use css_color_parser::Color as CssColor;
+use regex::Regex;
 
 #[cfg(feature = "i3")]
 use font_loader::system_fonts;
@@ -22,6 +23,17 @@ pub enum VerticalAlign {
     Top,
     Center,
     Bottom,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FilterMode {
+    /// Window must match all filters (AND)
+    #[default]
+    #[value(alias = "and")]
+    All,
+    /// Window must match at least one filter (OR)
+    #[value(alias = "or")]
+    Any,
 }
 
 /// Load a system font.
@@ -175,6 +187,128 @@ fn parse_exit_keys(s: &str) -> Result<utils::Sequence> {
     Ok(utils::Sequence::new(Some(s)))
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum FilterRule {
+    Class(Regex),
+    InitialClass(Regex),
+    Title(Regex),
+    InitialTitle(Regex),
+    Address(String),
+    WorkspaceId(i32),
+    WorkspaceName(Regex),
+    MonitorId(i64),
+    MonitorName(Regex),
+    Pid(i32),
+    Tag(Regex),
+    Floating(bool),
+    Pinned(bool),
+    XWayland(bool),
+    FullscreenBool(bool),
+    FullscreenMode(u8),
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct WindowFilter {
+    pub negated: bool,
+    pub rule: FilterRule,
+}
+
+fn compile_regex(pattern: &str) -> Result<Regex, String> {
+    Regex::new(pattern).map_err(|e| format!("Invalid regex '{pattern}': {e}"))
+}
+
+fn parse_bool_value(s: &str) -> Result<bool, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "Invalid boolean value '{s}', expected true/false, 1/0, yes/no, or on/off"
+        )),
+    }
+}
+
+pub fn normalize_address(addr: &str) -> String {
+    addr.trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_ascii_lowercase()
+}
+
+/// Parse a window filter in format `[!]<property>:<value>`.
+pub fn parse_window_filter(s: &str) -> Result<WindowFilter, String> {
+    let (negated, rest) = if let Some(stripped) = s.strip_prefix('!') {
+        (true, stripped)
+    } else {
+        (false, s)
+    };
+
+    let (prop_raw, val) = rest
+        .split_once(':')
+        .ok_or_else(|| format!("Invalid filter '{s}': expected '[!]<property>:<value>'"))?;
+
+    let prop_norm: String = prop_raw
+        .trim()
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+
+    let rule = match prop_norm.as_str() {
+        "class" => FilterRule::Class(compile_regex(val)?),
+        "initialclass" => FilterRule::InitialClass(compile_regex(val)?),
+        "title" => FilterRule::Title(compile_regex(val)?),
+        "initialtitle" => FilterRule::InitialTitle(compile_regex(val)?),
+        "address" | "addr" => {
+            let norm = normalize_address(val);
+            if norm.is_empty() {
+                return Err("Address filter value cannot be empty".to_string());
+            }
+            FilterRule::Address(norm)
+        }
+        "workspace" | "ws" => {
+            if let Ok(id) = val.trim().parse::<i32>() {
+                FilterRule::WorkspaceId(id)
+            } else {
+                FilterRule::WorkspaceName(compile_regex(val)?)
+            }
+        }
+        "monitor" | "mon" => {
+            if let Ok(id) = val.trim().parse::<i64>() {
+                FilterRule::MonitorId(id)
+            } else {
+                FilterRule::MonitorName(compile_regex(val)?)
+            }
+        }
+        "pid" => {
+            let pid = val
+                .trim()
+                .parse::<i32>()
+                .map_err(|_| format!("Invalid pid '{val}': expected integer"))?;
+            FilterRule::Pid(pid)
+        }
+        "tag" | "tags" => FilterRule::Tag(compile_regex(val)?),
+        "floating" => FilterRule::Floating(parse_bool_value(val)?),
+        "pinned" => FilterRule::Pinned(parse_bool_value(val)?),
+        "xwayland" => FilterRule::XWayland(parse_bool_value(val)?),
+        "fullscreen" => {
+            if let Ok(mode) = val.trim().parse::<u8>() {
+                FilterRule::FullscreenMode(mode)
+            } else {
+                FilterRule::FullscreenBool(parse_bool_value(val)?)
+            }
+        }
+        _ => {
+            return Err(format!(
+                "Unknown filter property '{prop_raw}'. Supported properties: class, initialClass, title, initialTitle, address, workspace, monitor, pid, tags, floating, fullscreen, pinned, xwayland"
+            ))
+        }
+    };
+
+    Ok(WindowFilter { negated, rule })
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "hyprselect", author, about, version)]
 pub struct AppConfig {
@@ -293,6 +427,28 @@ pub struct AppConfig {
     /// If this flag is set, the currently active window will swap with the selected window.
     #[arg(short, long)]
     pub swap: bool,
+
+    /// Filter Hyprland windows by property (format: [!]<property>:<value>, repeatable).
+    /// Supported properties: class, initialClass, title, initialTitle, address, workspace, monitor, pid, tags, floating, fullscreen, pinned, xwayland
+    #[arg(
+        short = 'F',
+        long = "filter",
+        value_name = "[!]<PROP>:<VALUE>",
+        value_parser(parse_window_filter)
+    )]
+    pub filters: Vec<WindowFilter>,
+
+    /// How multiple --filter flags are combined ('all'/'and' or 'any'/'or')
+    #[arg(
+        long = "filter-mode",
+        default_value = "all",
+        ignore_case = true
+    )]
+    pub filter_mode: FilterMode,
+
+    /// Match windows that satisfy any --filter flag (shorthand for --filter-mode any)
+    #[arg(long = "filter-any", conflicts_with = "filter_mode")]
+    pub filter_any: bool,
 }
 
 #[cfg(any(feature = "i3", feature = "hyprland"))]
@@ -302,5 +458,75 @@ pub fn parse_args() -> AppConfig {
         config.horizontal_align = HorizontalAlign::Center;
         config.vertical_align = VerticalAlign::Center;
     }
+    if config.filter_any {
+        config.filter_mode = FilterMode::Any;
+    }
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_window_filter_regex_and_negation() {
+        let f = parse_window_filter("class:^firefox$").unwrap();
+        assert!(!f.negated);
+        assert!(matches!(f.rule, FilterRule::Class(_)));
+
+        let f_neg = parse_window_filter("!title:.*vim.*").unwrap();
+        assert!(f_neg.negated);
+        assert!(matches!(f_neg.rule, FilterRule::Title(_)));
+
+        let f_ic = parse_window_filter("initialClass:kitty").unwrap();
+        assert!(!f_ic.negated);
+        assert!(matches!(f_ic.rule, FilterRule::InitialClass(_)));
+
+        let f_it = parse_window_filter("initial_title:Scratch").unwrap();
+        assert!(!f_it.negated);
+        assert!(matches!(f_it.rule, FilterRule::InitialTitle(_)));
+    }
+
+    #[test]
+    fn test_parse_window_filter_exact_and_bool() {
+        let f_addr = parse_window_filter("address:0x555ec23a3bb0").unwrap();
+        assert!(matches!(f_addr.rule, FilterRule::Address(ref a) if a == "555ec23a3bb0"));
+
+        let f_ws_id = parse_window_filter("workspace:2").unwrap();
+        assert!(matches!(f_ws_id.rule, FilterRule::WorkspaceId(2)));
+
+        let f_ws_name = parse_window_filter("workspace:special:.*").unwrap();
+        assert!(matches!(f_ws_name.rule, FilterRule::WorkspaceName(_)));
+
+        let f_mon_id = parse_window_filter("monitor:0").unwrap();
+        assert!(matches!(f_mon_id.rule, FilterRule::MonitorId(0)));
+
+        let f_mon_name = parse_window_filter("monitor:eDP-1").unwrap();
+        assert!(matches!(f_mon_name.rule, FilterRule::MonitorName(_)));
+
+        let f_pid = parse_window_filter("pid:4952").unwrap();
+        assert!(matches!(f_pid.rule, FilterRule::Pid(4952)));
+
+        let f_tag = parse_window_filter("tags:browser").unwrap();
+        assert!(matches!(f_tag.rule, FilterRule::Tag(_)));
+
+        let f_float = parse_window_filter("floating:true").unwrap();
+        assert!(matches!(f_float.rule, FilterRule::Floating(true)));
+
+        let f_fs_bool = parse_window_filter("fullscreen:false").unwrap();
+        assert!(matches!(f_fs_bool.rule, FilterRule::FullscreenBool(false)));
+
+        let f_fs_mode = parse_window_filter("fullscreen:2").unwrap();
+        assert!(matches!(f_fs_mode.rule, FilterRule::FullscreenMode(2)));
+    }
+
+    #[test]
+    fn test_parse_window_filter_errors() {
+        assert!(parse_window_filter("invalid_no_colon").is_err());
+        assert!(parse_window_filter("unknown_prop:val").is_err());
+        assert!(parse_window_filter("class:[unclosed").is_err());
+        assert!(parse_window_filter("pid:not_an_int").is_err());
+        assert!(parse_window_filter("floating:maybe").is_err());
+        assert!(parse_window_filter("address:0x").is_err());
+    }
 }

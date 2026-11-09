@@ -373,7 +373,9 @@ fn main() -> Result<()> {
     let app_config = args::parse_args();
 
     // Get visible windows from Hyprland
-    let desktop_windows_raw = wm::get_windows().context("Couldn't get desktop windows")?;
+    let desktop_windows_raw =
+        wm::get_windows_filtered(&app_config.filters, app_config.filter_mode)
+            .context("Couldn't get desktop windows")?;
 
     if desktop_windows_raw.is_empty() {
         warn!("No windows found");
